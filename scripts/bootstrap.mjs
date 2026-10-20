@@ -1,0 +1,77 @@
+// Lazily install npm dependencies on first run, then dispatch to the
+// real hook-router or MCP server. This makes the plugin work after
+// `claude plugin install` even when the cache directory has no node_modules.
+import { existsSync, writeFileSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const pluginRoot = path.dirname(__dirname);
+const installedMarker = path.join(pluginRoot, "node_modules", ".armorclaude-installed");
+const packageFiles = [
+  path.join(pluginRoot, "node_modules", "@armoriq", "sdk", "package.json"),
+  path.join(pluginRoot, "node_modules", "zod", "package.json"),
+  path.join(pluginRoot, "node_modules", "@modelcontextprotocol", "sdk", "package.json"),
+];
+
+// The marker is only trusted when all expected packages are also present.
+// Partial installs (e.g. zod present, sdk missing) would previously pass
+// the per-file check and the dispatch would crash on a missing import.
+function installedOk() {
+  if (!existsSync(installedMarker)) return false;
+  if (!packageFiles.every(existsSync)) return false;
+  try {
+    const markerVersion = readFileSync(installedMarker, "utf8").trim();
+    const pkg = JSON.parse(readFileSync(path.join(pluginRoot, "package.json"), "utf8"));
+    return markerVersion === pkg.version;
+  } catch {
+    return false;
+  }
+}
+
+if (!installedOk()) {
+  process.stderr.write("[armorclaude] installing dependencies (one-time)...\n");
+  // On Windows the npm launcher is npm.cmd, which Node cannot spawn without a
+  // shell — spawnSync("npm", …) fails with ENOENT and status null. Run through
+  // a shell there so the .cmd launcher resolves.
+  const isWindows = process.platform === "win32";
+  const result = spawnSync(
+    "npm",
+    ["install", "--omit=dev", "--ignore-scripts", "--silent", "--no-audit", "--no-fund"],
+    {
+      cwd: pluginRoot,
+      stdio: ["ignore", "ignore", "inherit"],
+      shell: isWindows,
+    }
+  );
+  if (result.status !== 0) {
+    const detail = result.error ? ": " + result.error.message : "";
+    process.stderr.write(
+      "[armorclaude] npm install failed (exit " + result.status + ")" + detail + "\n"
+    );
+    process.exit(1);
+  }
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(pluginRoot, "package.json"), "utf8"));
+    writeFileSync(installedMarker, pkg.version || "ok", "utf8");
+  } catch {
+    // best-effort — if we can't write the marker the next run will reinstall
+  }
+}
+
+const target = process.argv[2];
+if (target === "warm") {
+  // Dependencies are installed above; nothing else to do. The installer calls
+  // this so the first MCP connect doesn't have to wait on `npm install` — that
+  // wait exceeds Claude Code's handshake timeout and surfaces as
+  // "MCP error -32000: Connection closed".
+  process.exit(0);
+} else if (target === "router") {
+  await import("./hook-router.mjs");
+} else if (target === "mcp") {
+  await import("./policy-mcp.mjs");
+} else {
+  process.stderr.write("[armorclaude] bootstrap: unknown target '" + target + "'\n");
+  process.exit(2);
+}
