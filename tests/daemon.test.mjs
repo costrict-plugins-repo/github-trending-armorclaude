@@ -1,0 +1,404 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadConfig } from "../scripts/lib/config.mjs";
+import { tempHome, withHome } from "./helpers/login-profile.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(here, "..");
+const daemonScript = path.join(repoRoot, "scripts", "daemon.mjs");
+
+function buildEnv(dataDir) {
+  return {
+    ...process.env,
+    ARMORCLAUDE_DATA_DIR: dataDir,
+    ARMORCLAUDE_RUNTIME_FILE: path.join(dataDir, "runtime.json"),
+    ARMORCLAUDE_POLICY_FILE: path.join(dataDir, "policy.json"),
+    ARMORCLAUDE_DEBUG: "false",
+    ARMORCLAUDE_USE_SDK_INTENT: "false",
+    HOME: homes.get(dataDir) ?? homes.set(dataDir, tempHome()).get(dataDir),
+  };
+}
+
+const homes = new Map();
+
+async function spawnDaemonChild(dataDir) {
+  const env = buildEnv(dataDir);
+  const child = spawn(process.execPath, [daemonScript], {
+    detached: true,
+    stdio: "ignore",
+    env,
+    cwd: dataDir,
+  });
+  child.unref();
+  const socketPath = path.join(dataDir, "daemon.sock");
+  for (let i = 0; i < 30; i++) {
+    if (existsSync(socketPath)) return { child, socketPath };
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error("daemon did not create socket within 3s");
+}
+
+function ignoreGone(error) {
+  if (error?.code !== "ESRCH" && error?.code !== "ENOENT") throw error;
+}
+
+async function killDaemon(child) {
+  try {
+    process.kill(child.pid, "SIGTERM");
+  } catch (error) {
+    ignoreGone(error);
+  }
+  await new Promise((r) => setTimeout(r, 200));
+  try {
+    process.kill(child.pid, "SIGKILL");
+  } catch (error) {
+    ignoreGone(error);
+  }
+}
+
+async function loadConfigFor(dataDir) {
+  const env = buildEnv(dataDir);
+  return withHome(env.HOME, () => loadConfig(env));
+}
+
+test("daemon: ping responds with the package version and install directory + uptime", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-ping-"));
+  const { child } = await spawnDaemonChild(dataDir);
+  try {
+    const config = await loadConfigFor(dataDir);
+    const { pingDaemon } = await import("../scripts/lib/daemon-client.mjs");
+    const reply = await pingDaemon(config);
+    assert.ok(reply, "ping should return a reply");
+    assert.equal(reply.ok, true);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    assert.equal(reply.version, `${pkg.version}+${repoRoot}${path.sep}`);
+    assert.ok(reply.uptime >= 0);
+  } finally {
+    await killDaemon(child);
+  }
+});
+
+test("daemon: PreToolUse roundtrip returns null for fast-path tool", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-pre-"));
+  const { child } = await spawnDaemonChild(dataDir);
+  try {
+    const config = await loadConfigFor(dataDir);
+    const { dispatchViaDaemon } = await import("../scripts/lib/daemon-client.mjs");
+    const output = await dispatchViaDaemon({
+      event: "PreToolUse",
+      input: {
+        hook_event_name: "PreToolUse",
+        session_id: "sess-daemon-1",
+        tool_name: "read",
+        tool_input: { file_path: "x.txt" },
+      },
+      config,
+    });
+    assert.equal(output, null, `read should fast-path; got ${JSON.stringify(output)}`);
+  } finally {
+    await killDaemon(child);
+  }
+});
+
+test("daemon: SessionStart returns context output", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-start-"));
+  const { child } = await spawnDaemonChild(dataDir);
+  try {
+    const config = await loadConfigFor(dataDir);
+    const { dispatchViaDaemon } = await import("../scripts/lib/daemon-client.mjs");
+    const output = await dispatchViaDaemon({
+      event: "SessionStart",
+      input: {
+        hook_event_name: "SessionStart",
+        session_id: "sess-daemon-2",
+        source: "startup",
+      },
+      config,
+    });
+    const context = output?.hookSpecificOutput?.additionalContext || "";
+    assert.match(context, /ArmorClaude installed but NOT connected/i);
+    assert.match(context, /MONITOR mode/i);
+  } finally {
+    await killDaemon(child);
+  }
+});
+
+test("daemon: roundtrip latency p95 < 50ms (over Unix socket)", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-perf-"));
+  const { child } = await spawnDaemonChild(dataDir);
+  try {
+    const config = await loadConfigFor(dataDir);
+    const { dispatchViaDaemon } = await import("../scripts/lib/daemon-client.mjs");
+    const samples = [];
+    await dispatchViaDaemon({
+      event: "PreToolUse",
+      input: {
+        hook_event_name: "PreToolUse",
+        session_id: "warm",
+        tool_name: "read",
+        tool_input: {},
+      },
+      config,
+    });
+    for (let i = 0; i < 30; i++) {
+      const start = process.hrtime.bigint();
+      await dispatchViaDaemon({
+        event: "PreToolUse",
+        input: {
+          hook_event_name: "PreToolUse",
+          session_id: "perf-" + i,
+          tool_name: "read",
+          tool_input: { file_path: `f${i}.txt` },
+        },
+        config,
+      });
+      samples.push(Number(process.hrtime.bigint() - start) / 1_000_000);
+    }
+    samples.sort((a, b) => a - b);
+    const p95 = samples[Math.floor(samples.length * 0.95)];
+    const p50 = samples[Math.floor(samples.length * 0.5)];
+    assert.ok(
+      p95 < 50,
+      `daemon roundtrip p95 should be < 50ms; got p50=${p50.toFixed(2)} p95=${p95.toFixed(2)}`
+    );
+  } finally {
+    await killDaemon(child);
+  }
+});
+
+test("daemon: concurrent hooks for SAME session serialize (runtime-state stays consistent)", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-conc-"));
+  const { child } = await spawnDaemonChild(dataDir);
+  try {
+    const config = await loadConfigFor(dataDir);
+    const { dispatchViaDaemon } = await import("../scripts/lib/daemon-client.mjs");
+    const calls = Array.from({ length: 10 }, () =>
+      dispatchViaDaemon({
+        event: "SessionStart",
+        input: {
+          hook_event_name: "SessionStart",
+          session_id: "sess-conc-1",
+          source: "startup",
+        },
+        config,
+      })
+    );
+    const results = await Promise.all(calls);
+    for (const r of results) {
+      assert.ok(r?.hookSpecificOutput?.additionalContext);
+    }
+    const { readFile } = await import("node:fs/promises");
+    const raw = await readFile(path.join(dataDir, "runtime.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    assert.ok(parsed.sessions["sess-conc-1"]);
+  } finally {
+    await killDaemon(child);
+  }
+});
+
+test("daemon-client: spawnDaemon on missing socket (auto-spawn)", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-spawn-"));
+  try {
+    const config = await loadConfigFor(dataDir);
+    const { dispatchViaDaemon, pingDaemon } = await import("../scripts/lib/daemon-client.mjs");
+    const output = await dispatchViaDaemon({
+      event: "SessionStart",
+      input: {
+        hook_event_name: "SessionStart",
+        session_id: "sess-spawn-1",
+        source: "startup",
+      },
+      config,
+    });
+    assert.ok(output?.hookSpecificOutput?.additionalContext);
+    const ping = await pingDaemon(config);
+    assert.ok(ping?.ok);
+  } finally {
+    try {
+      const { readFile } = await import("node:fs/promises");
+      const pid = parseInt(await readFile(path.join(dataDir, "daemon.pid"), "utf8"), 10);
+      if (Number.isFinite(pid)) process.kill(pid, "SIGTERM");
+    } catch (error) {
+      ignoreGone(error);
+    }
+  }
+});
+
+function waitForExit(child) {
+  return new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+}
+
+test("daemon-client: a daemon that dies on startup reports its exit and logs to daemon.log", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-crash-"));
+  const { writeFile, readFile } = await import("node:fs/promises");
+  await writeFile(path.join(dataDir, "profiles"), "not a directory");
+  const config = await loadConfigFor(dataDir);
+  const { dispatchViaDaemon } = await import("../scripts/lib/daemon-client.mjs");
+  await assert.rejects(
+    dispatchViaDaemon({
+      event: "SessionStart",
+      input: { hook_event_name: "SessionStart", session_id: "sess-crash-1", source: "startup" },
+      config,
+    }),
+    (err) => {
+      assert.match(
+        err.message,
+        /daemon exited \(code=1, signal=null\) before accepting connections/
+      );
+      assert.ok(err.message.includes(path.join(dataDir, "daemon.log")));
+      return true;
+    }
+  );
+  const log = await readFile(path.join(dataDir, "daemon.log"), "utf8");
+  assert.match(log, /profiles/);
+});
+
+test("daemon-client: a spawned daemon logs its listening line to daemon.log", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-log-"));
+  const { readFile } = await import("node:fs/promises");
+  const config = await loadConfigFor(dataDir);
+  const { dispatchViaDaemon } = await import("../scripts/lib/daemon-client.mjs");
+  let pid;
+  try {
+    await dispatchViaDaemon({
+      event: "SessionStart",
+      input: { hook_event_name: "SessionStart", session_id: "sess-log-1", source: "startup" },
+      config,
+    });
+    pid = parseInt(await readFile(path.join(dataDir, "daemon.pid"), "utf8"), 10);
+    const log = await readFile(path.join(dataDir, "daemon.log"), "utf8");
+    assert.match(
+      log,
+      new RegExp(`\\[armorclaude-daemon\\] listening on .* pid=${pid} version=\\S+ at=`)
+    );
+  } finally {
+    if (Number.isFinite(pid)) process.kill(pid, "SIGTERM");
+  }
+});
+
+async function withSlowDaemonStart(dataDir, ms, fn) {
+  const { writeFile } = await import("node:fs/promises");
+  const preload = path.join(dataDir, "slow-start.cjs");
+  await writeFile(
+    preload,
+    `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${ms});\n`
+  );
+  const saved = process.env.NODE_OPTIONS;
+  process.env.NODE_OPTIONS = `--require ${preload}`;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = saved;
+  }
+}
+
+test("daemon-client: a daemon slower to start than 450 ms still serves the hook (#168)", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-slow-"));
+  const { readFile } = await import("node:fs/promises");
+  const config = await loadConfigFor(dataDir);
+  const { dispatchViaDaemon } = await import("../scripts/lib/daemon-client.mjs");
+  try {
+    const output = await withSlowDaemonStart(dataDir, 1_000, () =>
+      dispatchViaDaemon({
+        event: "SessionStart",
+        input: { hook_event_name: "SessionStart", session_id: "sess-slow-1", source: "startup" },
+        config,
+      })
+    );
+    assert.ok(output?.hookSpecificOutput?.additionalContext);
+  } finally {
+    try {
+      process.kill(
+        parseInt(await readFile(path.join(dataDir, "daemon.pid"), "utf8"), 10),
+        "SIGTERM"
+      );
+    } catch (error) {
+      ignoreGone(error);
+    }
+  }
+});
+
+test("daemon-client: a daemon that crashes after a slow start reports the crash (#168)", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-slowcrash-"));
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(path.join(dataDir, "profiles"), "not a directory");
+  const config = await loadConfigFor(dataDir);
+  const { dispatchViaDaemon } = await import("../scripts/lib/daemon-client.mjs");
+  await withSlowDaemonStart(dataDir, 1_000, () =>
+    assert.rejects(
+      dispatchViaDaemon({
+        event: "SessionStart",
+        input: { hook_event_name: "SessionStart", session_id: "sess-slow-2", source: "startup" },
+        config,
+      }),
+      /daemon exited \(code=1, signal=null\) before accepting connections/
+    )
+  );
+});
+
+test("daemon: a server error exits 1 and removes the PID file", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-bind-"));
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(path.join(dataDir, "daemon.sock"));
+  const child = spawn(process.execPath, [daemonScript], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: buildEnv(dataDir),
+    cwd: dataDir,
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const timer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+  const { code, signal } = await waitForExit(child);
+  clearTimeout(timer);
+  assert.equal(signal, null);
+  assert.equal(code, 1);
+  assert.match(stderr, /\[armorclaude-daemon\] server error:/);
+  assert.equal(existsSync(path.join(dataDir, "daemon.pid")), false);
+});
+
+test("hook-router: a daemon-answered hook loads neither the engine nor the SDK root", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "armorclaude-daemon-router-"));
+  const { child } = await spawnDaemonChild(dataDir);
+  try {
+    const loadHook = `export async function load(u,c,n){if(/\\/lib\\/(engine|observability)\\.mjs$/.test(u))process.stderr.write("loaded "+u+"\\n");return n(u,c)}`;
+    const reportCjs = `process.on("exit",()=>{for(const k of Object.keys(Module._cache))if(/@armoriq\\/sdk\\/dist\\/index\\.js$/.test(k))process.stderr.write("loaded "+k+"\\n")});`;
+    const trace = `data:text/javascript,${encodeURIComponent(
+      `import Module,{register}from"node:module";register(${JSON.stringify("data:text/javascript," + encodeURIComponent(loadHook))});${reportCjs}`
+    )}`;
+    const router = spawn(
+      process.execPath,
+      ["--import", trace, path.join(repoRoot, "scripts", "hook-router.mjs")],
+      {
+        env: buildEnv(dataDir),
+        cwd: dataDir,
+      }
+    );
+    let stdout = "";
+    let stderr = "";
+    router.stdout.on("data", (c) => (stdout += c));
+    router.stderr.on("data", (c) => (stderr += c));
+    router.stdin.end(
+      JSON.stringify({
+        hook_event_name: "PreToolUse",
+        session_id: "sess-router-1",
+        tool_name: "read",
+        tool_input: { file_path: "x.txt" },
+      })
+    );
+    const code = await new Promise((r) => router.on("close", r));
+    assert.equal(code, 0, stderr);
+    assert.equal(stdout, "", `read should fast-path through the daemon; got ${stdout}`);
+    assert.doesNotMatch(stderr, /loaded /);
+    const log = path.join(dataDir, "daemon.log");
+    assert.doesNotMatch(existsSync(log) ? readFileSync(log, "utf8") : "", /in-process/);
+  } finally {
+    await killDaemon(child);
+  }
+});
